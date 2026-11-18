@@ -151,41 +151,47 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     handler: async (ctx) => toggleLimiter(ctx),
   });
 
-  // Process outgoing messages to apply word limit
-  pi.on("before_send_message", async (event) => {
-    // Only apply to assistant messages when limiter is enabled
+  // Truncate finalized assistant messages to apply the word limit.
+  // `message_end` can return `{ message }` to replace the finalized message
+  // (the replacement must keep the same role).
+  pi.on("message_end", async (event) => {
     if (!state.enabled || event.message.role !== "assistant") return;
-    
+    const content = event.message.content;
     // Handle string content
-    if (typeof event.message.content === "string") {
-      const wordCount = countWords(event.message.content);
+    if (typeof content === "string") {
+      const wordCount = countWords(content);
       if (wordCount > state.wordLimit) {
         return {
           message: {
             ...event.message,
-            content: truncateText(event.message.content, state.wordLimit)
+            content: truncateText(content, state.wordLimit)
           }
         };
       }
+      return;
     }
-    
-    // Handle array content (blocks)
-    if (Array.isArray(event.message.content)) {
-      const content = event.message.content;
+
+    // Handle array content (blocks): apply the limit across all text blocks
+    if (Array.isArray(content)) {
+      let remaining = state.wordLimit;
       let modified = false;
-      const newContent = content.map(block => {
-        // Only process text blocks
+      const newContent = content.flatMap(block => {
         if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string") {
-          const wordCount = countWords(block.text);
-          if (wordCount > state.wordLimit) {
+          // Budget exhausted: drop further text blocks entirely
+          if (remaining <= 0) {
             modified = true;
-            return {
-              ...block,
-              text: truncateText(block.text, state.wordLimit)
-            };
+            return [];
           }
+          const wordCount = countWords(block.text);
+          if (wordCount > remaining) {
+            modified = true;
+            const truncated = truncateText(block.text, remaining);
+            remaining = 0;
+            return [{ ...block, text: truncated }];
+          }
+          remaining -= wordCount;
         }
-        return block;
+        return [block];
       });
       
       if (modified) {
@@ -199,13 +205,28 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     }
   });
 
+  // Cap assistant text while it streams (display only; stored message is unchanged).
+  // An extension has one transformer, so this replaces any other one registered by this plugin.
+  pi.registerMarkdownTransformer(
+    (markdown, { messageType, isStreaming }) => {
+      if (!state.enabled || messageType !== "assistant") return markdown;
+      if (countWords(markdown) <= state.wordLimit) return markdown;
+      const words = markdown.trim().split(/\s+/);
+      return words.slice(0, state.wordLimit).join(" ") + (isStreaming ? "" : TRUNCATION_MARKER);
+    },
+    { messageTypes: ["assistant"] },
+  );
+
   // Register command to control the limiter
   pi.registerCommand("textlimit", {
     description: "Control the text generation limiter",
     getArgumentCompletions: (prefix: string) => {
-      const candidates = ["status", "toggle", "on", "off", "50", "100", "200", "300", "400", "500"];
+      const candidates = ["status", "toggle", "on", "off", "20", "50", "100", "200", "300", "400", "500"];
+      const typed = prefix.trim().toLowerCase();
+      // Numeric input is free-form: never offer suggestions for it, so Enter submits exactly what was typed
+      if (/^\d/.test(typed)) return null;
       const matches = candidates
-        .filter((value) => value.startsWith(prefix.trim().toLowerCase()))
+        .filter((value) => value.startsWith(typed))
         .map((value) => ({ value, label: value }));
       return matches.length > 0 ? matches : null;
     },
