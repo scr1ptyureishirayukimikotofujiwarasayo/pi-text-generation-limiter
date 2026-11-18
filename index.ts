@@ -1,0 +1,241 @@
+/**
+ * pi-text-generation-limiter
+ *
+ * A simple text generation limiter for Pi Code that helps control output length
+ * without aggressive system prompts or token limits.
+ *
+ * Features:
+ * 1. Word count limiting - Sets a soft word limit for responses
+ * 2. Text truncation - Truncates overly long responses with a marker
+ * 3. Simple notification system - Informs users about text limits
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+/** State entry key for persistence */
+const STATE_ENTRY = "text-generation-limiter";
+
+/** Status key for UI display */
+const STATUS_KEY = "textlimiter";
+
+/** Default word limit for responses */
+const DEFAULT_WORD_LIMIT = 100;
+
+/** Minimum allowed word limit */
+const MIN_WORD_LIMIT = 1;
+
+/** Maximum allowed word limit */
+const MAX_WORD_LIMIT = 500;
+
+/** Marker for truncated text */
+const TRUNCATION_MARKER = " ...(text truncated by limiter)";
+
+/** Type for the limiter state */
+interface LimiterState {
+  enabled: boolean;
+  wordLimit: number;
+}
+
+/** Count whitespace-separated words in text */
+function countWords(text: string): number {
+  const words = text.trim().split(/\s+/);
+  return words.length === 1 && words[0] === "" ? 0 : words.length;
+}
+
+/** Truncate text to approximately the specified word limit */
+function truncateText(text: string, wordLimit: number): string {
+  // If text is already within limit, return as is
+  if (countWords(text) <= wordLimit) {
+    return text;
+  }
+  
+  // Split into words and take only what we need
+  const words = text.trim().split(/\s+/);
+  const truncatedWords = words.slice(0, wordLimit);
+  return truncatedWords.join(" ") + TRUNCATION_MARKER;
+}
+
+export default function textGenerationLimiter(pi: ExtensionAPI) {
+  const state: LimiterState = {
+    enabled: false,
+    wordLimit: DEFAULT_WORD_LIMIT,
+  };
+
+  /** Update UI status display */
+  const setStatus = (ctx: ExtensionContext): void => {
+    ctx.ui.setStatus(
+      STATUS_KEY,
+      state.enabled ? `≤${state.wordLimit}w` : undefined,
+    );
+  };
+
+  /** Save state to session */
+  const save = (): void => {
+    pi.appendEntry(STATE_ENTRY, {
+      enabled: state.enabled,
+      wordLimit: state.wordLimit,
+    });
+  };
+
+  /** Restore state from session */
+  const restore = (ctx: ExtensionContext): void => {
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
+      const data = entry.data as Partial<LimiterState> | undefined;
+      if (!data) continue;
+      if (typeof data.enabled === "boolean") state.enabled = data.enabled;
+      if (typeof data.wordLimit === "number") {
+        state.wordLimit = Math.min(MAX_WORD_LIMIT, Math.max(MIN_WORD_LIMIT, Math.round(data.wordLimit)));
+      }
+    }
+    setStatus(ctx);
+  };
+
+  /** Notify user about current settings */
+  const notifySettings = (ctx: ExtensionContext): void => {
+    if (!state.enabled) {
+      ctx.ui.notify("Text generation limiter is OFF", "info");
+      return;
+    }
+    ctx.ui.notify(`Text generation limiter ON: max ${state.wordLimit} words`, "info");
+  };
+
+  /** Commit state changes */
+  const commit = (ctx: ExtensionContext): void => {
+    save();
+    setStatus(ctx);
+    notifySettings(ctx);
+  };
+
+  /** Toggle limiter on/off */
+  const toggleLimiter = (ctx: ExtensionContext): void => {
+    state.enabled = !state.enabled;
+    commit(ctx);
+  };
+
+  /** Set limiter enabled/disabled */
+  const setLimiterEnabled = (ctx: ExtensionContext, enabled: boolean): void => {
+    if (state.enabled === enabled) {
+      ctx.ui.notify(enabled ? "Text limiter already ON" : "Text limiter already OFF", "info");
+      return;
+    }
+    state.enabled = enabled;
+    commit(ctx);
+  };
+
+  /** Set word limit */
+  const setWordLimit = (ctx: ExtensionContext, limit: number): void => {
+    const clampedLimit = Math.min(MAX_WORD_LIMIT, Math.max(MIN_WORD_LIMIT, Math.round(limit)));
+    if (state.wordLimit === clampedLimit) {
+      ctx.ui.notify(`Word limit already set to ${clampedLimit}`, "info");
+      return;
+    }
+    state.wordLimit = clampedLimit;
+    commit(ctx);
+  };
+
+  // Restore state on session start
+  pi.on("session_start", async (_event, ctx) => {
+    restore(ctx);
+  });
+
+  // Restore state on session tree changes
+  pi.on("session_tree", async (_event, ctx) => {
+    restore(ctx);
+  });
+
+  // Register shortcut to toggle limiter
+  pi.registerShortcut("ctrl+alt+l", {
+    description: "Toggle text generation limiter",
+    handler: async (ctx) => toggleLimiter(ctx),
+  });
+
+  // Process outgoing messages to apply word limit
+  pi.on("before_send_message", async (event) => {
+    // Only apply to assistant messages when limiter is enabled
+    if (!state.enabled || event.message.role !== "assistant") return;
+    
+    // Handle string content
+    if (typeof event.message.content === "string") {
+      const wordCount = countWords(event.message.content);
+      if (wordCount > state.wordLimit) {
+        return {
+          message: {
+            ...event.message,
+            content: truncateText(event.message.content, state.wordLimit)
+          }
+        };
+      }
+    }
+    
+    // Handle array content (blocks)
+    if (Array.isArray(event.message.content)) {
+      const content = event.message.content;
+      let modified = false;
+      const newContent = content.map(block => {
+        // Only process text blocks
+        if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string") {
+          const wordCount = countWords(block.text);
+          if (wordCount > state.wordLimit) {
+            modified = true;
+            return {
+              ...block,
+              text: truncateText(block.text, state.wordLimit)
+            };
+          }
+        }
+        return block;
+      });
+      
+      if (modified) {
+        return {
+          message: {
+            ...event.message,
+            content: newContent
+          }
+        };
+      }
+    }
+  });
+
+  // Register command to control the limiter
+  pi.registerCommand("textlimit", {
+    description: "Control the text generation limiter",
+    getArgumentCompletions: (prefix: string) => {
+      const candidates = ["status", "toggle", "on", "off", "50", "100", "200", "300", "400", "500"];
+      const matches = candidates
+        .filter((value) => value.startsWith(prefix.trim().toLowerCase()))
+        .map((value) => ({ value, label: value }));
+      return matches.length > 0 ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase();
+      const usage = "Usage: /textlimit <1-500> | on | off | toggle | status";
+
+      if (arg === "" || arg === "status") {
+        notifySettings(ctx);
+        return;
+      }
+
+      if (arg === "toggle") {
+        toggleLimiter(ctx);
+        return;
+      }
+
+      if (arg === "off" || arg === "disable") {
+        setLimiterEnabled(ctx, false);
+      } else if (arg === "on" || arg === "enable") {
+        setLimiterEnabled(ctx, true);
+      } else {
+        const value = Number(arg);
+        if (!Number.isFinite(value) || value < MIN_WORD_LIMIT) {
+          ctx.ui.notify(usage, "warning");
+          return;
+        }
+        setWordLimit(ctx, value);
+        setLimiterEnabled(ctx, true); // Enable when setting a limit
+      }
+    },
+  });
+}

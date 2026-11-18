@@ -1,0 +1,35 @@
+{
+	"name": "pi-text-generation-limiter",
+	"version": "1.0.0",
+	"description": "A simple text generation limiter for Pi Code that helps control output length without aggressive system prompts or token limits",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"text-limiter",
+		"output-limiter",
+		"word-limit"
+	],
+	"license": "MIT",
+	"type": "module",
+	"engines": {
+		"node": ">=22.18.0"
+	},
+	"files": [
+		"index.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	}
+}
