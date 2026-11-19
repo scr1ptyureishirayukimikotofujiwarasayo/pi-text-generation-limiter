@@ -10,10 +10,6 @@
  * 3. Tool output - text returned by tool calls, truncated before it is sent back to the model
  *
  * Reasoning limiting caps only the stored/displayed thinking text, never reasoning tokens.
- *
- * Silent compaction (`/silentcompaction <tokens>`) replaces the old tool-output trimmer: when the
- * context grows past the threshold, the conversation is compacted in the background without
- * interrupting the running task.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -27,9 +23,12 @@ const STATUS_KEY = "textlimiter";
 /** Default word limit */
 const DEFAULT_WORD_LIMIT = 100;
 
-/** Bounds for the silent compaction token threshold (0 = disabled) */
-const MIN_COMPACT_TOKENS = 1000;
-const MAX_COMPACT_TOKENS = 10_000_000;
+/** Default number of most recent tool results kept in full context */
+const DEFAULT_KEEP_RECENT_TOOLS = 12;
+
+/** Bounds for the recent tool result count */
+const MIN_KEEP_RECENT_TOOLS = 1;
+const MAX_KEEP_RECENT_TOOLS = 100;
 
 /** Minimum allowed word limit */
 const MIN_WORD_LIMIT = 1;
@@ -44,18 +43,13 @@ const TRUNCATION_MARKER = " ...(text truncated by limiter)";
 interface LimiterState {
   enabled: boolean;
   wordLimit: number;
-  /** Silently compact when context tokens exceed this; 0 = silent compaction off. */
-  compactTokens: number;
+  /** Keep this many most recent tool results in full; older ones are replaced with a placeholder. */
+  keepRecentTools: number;
 }
 
 /** Clamp and round a word limit into the allowed range */
 function clampLimit(limit: number): number {
   return Math.min(MAX_WORD_LIMIT, Math.max(MIN_WORD_LIMIT, Math.round(limit)));
-}
-
-/** Clamp a silent compaction token threshold into the allowed range */
-function clampCompactTokens(tokens: number): number {
-  return Math.min(MAX_COMPACT_TOKENS, Math.max(MIN_COMPACT_TOKENS, Math.round(tokens)));
 }
 
 /** Count whitespace-separated words in text */
@@ -111,18 +105,12 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
   const state: LimiterState = {
     enabled: false,
     wordLimit: DEFAULT_WORD_LIMIT,
-    compactTokens: 0,
+    keepRecentTools: DEFAULT_KEEP_RECENT_TOOLS,
   };
-
-  /** True while a silent compaction is running, so we don't queue duplicates. */
-  let compacting = false;
 
   /** Update UI status display */
   const setStatus = (ctx: ExtensionContext): void => {
-    const parts: string[] = [];
-    if (state.enabled) parts.push(`≤${state.wordLimit}w`);
-    if (state.compactTokens > 0) parts.push(`compact@${state.compactTokens}t`);
-    ctx.ui.setStatus(STATUS_KEY, parts.length > 0 ? parts.join("·") : undefined);
+    ctx.ui.setStatus(STATUS_KEY, state.enabled ? `≤${state.wordLimit}w·last${state.keepRecentTools}t` : undefined);
   };
 
   /** Save state to session */
@@ -130,7 +118,7 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     pi.appendEntry(STATE_ENTRY, {
       enabled: state.enabled,
       wordLimit: state.wordLimit,
-      compactTokens: state.compactTokens,
+      keepRecentTools: state.keepRecentTools,
     });
   };
 
@@ -142,8 +130,8 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
       if (!data) continue;
       if (typeof data.enabled === "boolean") state.enabled = data.enabled;
       if (typeof data.wordLimit === "number") state.wordLimit = clampLimit(data.wordLimit);
-      if (typeof data.compactTokens === "number") {
-        state.compactTokens = data.compactTokens > 0 ? clampCompactTokens(data.compactTokens) : 0;
+      if (typeof data.keepRecentTools === "number") {
+        state.keepRecentTools = Math.min(MAX_KEEP_RECENT_TOOLS, Math.max(MIN_KEEP_RECENT_TOOLS, Math.round(data.keepRecentTools)));
       }
     }
     setStatus(ctx);
@@ -151,9 +139,11 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
 
   /** Notify user about current settings */
   const notifySettings = (ctx: ExtensionContext): void => {
-    const limiter = state.enabled ? `ON: max ${state.wordLimit} words` : "OFF";
-    const compact = state.compactTokens > 0 ? `ON at ${state.compactTokens} tokens` : "OFF";
-    ctx.ui.notify(`Text generation limiter ${limiter} (chat, reasoning, tool output) · Silent compaction ${compact}`, "info");
+    const status = state.enabled ? `ON: max ${state.wordLimit} words, keep last ${state.keepRecentTools} tool results` : "OFF";
+    ctx.ui.notify(
+      `Text generation limiter ${status} (applies to chat, reasoning and tool output)`,
+      "info",
+    );
   };
 
   /** Commit state changes */
@@ -228,26 +218,56 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     }
   });
 
-  // Silent compaction: after each turn, if context exceeds the threshold, compact in the
-  // background. ctx.compact() is non-blocking, and we only surface a message on failure, so the
-  // running task is not interrupted.
-  const maybeCompact = (ctx: ExtensionContext): void => {
-    if (state.compactTokens <= 0 || compacting) return;
-    const usage = ctx.getContextUsage();
-    if (!usage || usage.tokens == null || usage.tokens < state.compactTokens) return;
-    compacting = true;
-    ctx.compact({
-      customInstructions: "Summarize the conversation so far concisely, preserving the current task, decisions, open questions and relevant file paths.",
-      onComplete: () => { compacting = false; },
-      onError: (error) => {
-        compacting = false;
-        ctx.ui.notify(`Silent compaction failed: ${error.message}`, "error");
-      },
-    });
-  };
+  // Cap OLDER tool results before each LLM call. The most recent batch of tool results is
+  // left intact so the model can act on its current data without re-running tools.
+  // Works on a copy (the `context` event is non-destructive), so the stored session is unchanged.
+  // Image blocks pass through. Error results are left intact so failures stay readable.
+  pi.on("context", async (event) => {
+    if (!state.enabled) return;
+    const messages: any[] = event.messages;
 
-  pi.on("turn_end", async (_event, ctx) => {
-    maybeCompact(ctx);
+    // The latest turn starts at the last assistant message. Tool results after it are the
+    // model's current data and stay intact; everything before it is older and gets capped.
+    let latestStart = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "assistant") {
+        latestStart = i;
+        break;
+      }
+    }
+
+    // Index of the oldest tool result still kept in full. Tool results before it are replaced
+    // with a placeholder (the tool call stays in the transcript, so no call is left unanswered).
+    const toolIdx: number[] = [];
+    messages.forEach((m: any, i: number) => { if (m?.role === "toolResult") toolIdx.push(i); });
+    const keepFrom = toolIdx.length > state.keepRecentTools ? toolIdx[toolIdx.length - state.keepRecentTools] : 0;
+
+    let modified = false;
+    const out = messages.map((msg: any, i: number) => {
+      if (msg?.role === "toolResult" && i < keepFrom && !msg.isError && Array.isArray(msg.content)) {
+        const words = msg.content.reduce((n: number, b: any) =>
+          n + (b?.type === "text" && typeof b.text === "string" ? countWords(b.text) : 0), 0);
+        modified = true;
+        return {
+          ...msg,
+          content: [{ type: "text", text: `[${msg.toolName} output omitted to save context (${words} words). Re-run the tool if you need it.]` }],
+        };
+      }
+      if (i >= latestStart) return msg;
+      if (msg?.role !== "toolResult" || msg.isError || !Array.isArray(msg.content)) return msg;
+
+      // Tell the model the output is partial and how much was cut, so it doesn't loop re-running the tool.
+      const toolMarker = (omitted: number) =>
+        ` ...[${omitted} more words omitted from this older tool output to save context; re-run the tool if you need it]`;
+      const { blocks, modified: changed } = capBlocks(msg.content, "text", state.wordLimit, toolMarker);
+      if (!changed) return msg;
+      modified = true;
+      return { ...msg, content: blocks };
+    });
+
+    if (modified) {
+      return { messages: out };
+    }
   });
 
   // Cap assistant text and reasoning while they stream (display only; stored message is unchanged).
@@ -263,57 +283,14 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     { messageTypes: ["assistant", "assistant-thinking"] },
   );
 
-  // Command: /silentcompaction <tokens> | off | status
-  pi.registerCommand("silentcompaction", {
-    description: "Silently compact the conversation in the background once context exceeds <tokens>",
-    getArgumentCompletions: (prefix: string) => {
-      const typed = prefix.trim().toLowerCase();
-      if (/^\d/.test(typed)) return null;
-      const matches = ["off", "status", "50000", "100000", "150000"]
-        .filter((value) => value.startsWith(typed))
-        .map((value) => ({ value, label: value }));
-      return matches.length > 0 ? matches : null;
-    },
-    handler: async (args, ctx) => {
-      const arg = args.trim().toLowerCase();
-      const usage = `Usage: /silentcompaction <${MIN_COMPACT_TOKENS}-${MAX_COMPACT_TOKENS}> | off | status`;
-
-      if (arg === "" || arg === "status") {
-        const msg = state.compactTokens > 0
-          ? `Silent compaction ON: compacts in the background above ${state.compactTokens} context tokens`
-          : "Silent compaction OFF";
-        ctx.ui.notify(msg, "info");
-        return;
-      }
-
-      if (arg === "off" || arg === "disable") {
-        state.compactTokens = 0;
-        save();
-        setStatus(ctx);
-        ctx.ui.notify("Silent compaction OFF", "info");
-        return;
-      }
-
-      const value = Number(arg);
-      if (!Number.isFinite(value) || value < MIN_COMPACT_TOKENS) {
-        ctx.ui.notify(usage, "warning");
-        return;
-      }
-      state.compactTokens = clampCompactTokens(value);
-      save();
-      setStatus(ctx);
-      ctx.ui.notify(`Silent compaction ON: compacts in the background above ${state.compactTokens} context tokens`, "info");
-    },
-  });
-
   // Command: /textlimit <n> | on | off | toggle | status
   pi.registerCommand("textlimit", {
     description: "Control the text generation limiter (chat, reasoning and tool output)",
     getArgumentCompletions: (prefix: string) => {
-      const candidates = ["status", "toggle", "on", "off", "20", "50", "100", "200", "300", "400", "500"];
+      const candidates = ["status", "toggle", "on", "off", "context", "context 10", "context 12", "context 15", "20", "50", "100", "200", "300", "400", "500"];
       const typed = prefix.trim().toLowerCase();
       // Numeric input is free-form: never offer suggestions for it, so Enter submits exactly what was typed
-      if (/^\d/.test(typed)) return null;
+      if (/^\d/.test(typed) || /^context\s+\d/.test(typed)) return null;
       const matches = candidates
         .filter((value) => value.startsWith(typed))
         .map((value) => ({ value, label: value }));
@@ -321,10 +298,27 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
-      const usage = "Usage: /textlimit <1-500> | on | off | toggle | status";
+      const usage = "Usage: /textlimit <1-500> | on | off | toggle | status | context <1-100>";
 
       if (arg === "" || arg === "status") {
         notifySettings(ctx);
+        return;
+      }
+
+      // Context trimming: /textlimit context <N>  (keep the N most recent tool results in full)
+      if (arg === "context" || arg.startsWith("context ")) {
+        const sub = arg.slice("context".length).trim();
+        const value = Number(sub);
+        if (!Number.isFinite(value) || value < MIN_KEEP_RECENT_TOOLS) {
+          ctx.ui.notify("Usage: /textlimit context <1-100>  (keep this many most recent tool results in full)", "warning");
+          return;
+        }
+        const clamped = Math.min(MAX_KEEP_RECENT_TOOLS, Math.max(MIN_KEEP_RECENT_TOOLS, Math.round(value)));
+        state.keepRecentTools = clamped;
+        setLimiterEnabled(ctx, true);
+        save();
+        setStatus(ctx);
+        ctx.ui.notify(`Context trimming: keeping the last ${clamped} tool results in full`, "info");
         return;
       }
 
