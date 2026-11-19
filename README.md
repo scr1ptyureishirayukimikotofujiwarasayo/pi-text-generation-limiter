@@ -2,14 +2,14 @@
 
 A simple [pi](https://pi.dev) extension that provides gentle text generation limiting without aggressive system prompts or hard token limits.
 
-Unlike heavy-handed solutions, this extension focuses on a lightweight approach to controlling output length by simply truncating overly long responses rather than forcing complex system instructions or hard limits.
+Unlike heavy-handed solutions, this extension focuses on a lightweight approach to controlling output length by simply truncating overly long text rather than forcing complex system instructions or hard limits.
 
 ## Features
 
-- **Soft Word Limiting**: Gently limits the length of generated text by truncating responses that exceed your specified word limit
-- **No Aggressive Prompts**: Doesn't inject harsh system instructions that might affect model behavior
-- **Simple Controls**: Easy on/off toggle with customizable word limits
-- **Unobtrusive**: Only activates when you want it to, with clear status indicators
+- **One limit, three surfaces**: a single word limit covers chat text, model reasoning, and tool call output
+- **Lower cost**: tool output is truncated before it is sent back to the model, so it stops re-reading long outputs every turn
+- **No Aggressive Prompts**: doesn't inject system instructions or change model behavior
+- **Simple controls**: one command, one number
 
 ## Installation
 
@@ -27,37 +27,27 @@ Quantum computers use qubits... (automatically truncated if over 100 words)
 
 | Command | Result |
 |---|---|
-| `/textlimit` or `/textlimit status` | Show whether the limiter is **on** or **off**, plus the current word limit |
-| `/textlimit toggle` | Flip **on ⇄ off** |
-| `/textlimit on` | Turn on with the default limit (`100` words) |
-| `/textlimit off` | Turn off |
-| `/textlimit 250` | Turn on with a 250-word limit (`1`–`500` words) |
-| `Ctrl+Alt+L` | Toggle **on ⇄ off** |
+| `/textlimit <n>` | Turn on with an `n`-word limit (`1`–`500`) |
+| `/textlimit` or `/textlimit status` | Show whether the limiter is on or off, and the current limit |
+| `/textlimit on` / `/textlimit off` | Turn on (current limit) / off |
+| `/textlimit toggle` | Flip on ⇄ off |
+| `Ctrl+Alt+L` | Toggle on ⇄ off |
 
-The footer shows `≤<n>w` (word limit) while on.
+The footer shows `≤<n>w` while on. The limit and on/off state persist across sessions.
 
-### Reasoning limit
+### What the limit applies to
 
-The same word limiting can be applied to a model's **reasoning** (thinking) text, with its own budget independent of the chat limit. This caps only the *displayed/stored thinking text*; it never caps reasoning tokens, so the model can finish its reasoning and tasks are not interrupted.
+When on, the same word limit is applied to:
 
-| Command | Result |
-|---|---|
-| `/textlimit think` or `/textlimit think toggle` | Flip reasoning limiter on ⇄ off |
-| `/textlimit think on` / `think off` | Turn reasoning limiter on / off |
-| `/textlimit think 150` | Turn on with a 150-word reasoning limit (`1`–`500`) |
-| `Ctrl+Alt+R` | Toggle reasoning limiter on ⇄ off |
+1. **Chat text**: assistant text, truncated when the message is finalized (and capped while it streams).
+2. **Reasoning (thinking)**: the stored/displayed thinking text is capped. This limits only the text, never the reasoning tokens, so the model can finish its reasoning.
+3. **Tool output**: text returned by tool calls (e.g. `bash`, `read`, search output) is truncated before it is sent back to the model. This shrinks the context re-read on every later turn, which is where the cost saving comes from. Image blocks pass through, and error results are left intact so failures stay readable.
 
-The footer shows `think≤<n>w` while on. The chat and reasoning limits are independent and both persist across sessions. `/textlimit status` shows both.
+Each surface gets its own budget of `n` words (chat, reasoning, and each tool result are counted separately). Truncated text ends with a `(text truncated by limiter)` marker.
 
-### How It Works
+## How It Works
 
-When enabled, the extension monitors outgoing assistant messages and automatically truncates any text blocks that exceed your specified word limit. The truncation is marked with a `(text truncated by limiter)` indicator so you know when it has been applied.
-
-The extension does not inject any system prompts or modify model behavior - it simply post-processes the output to keep it within your specified limits.
-
-## Configuration
-
-The extension maintains its state across sessions, so your settings will persist between restarts.
+When enabled, the extension post-processes outgoing text. It never injects system prompts or modifies how the model is run; it only truncates what is stored, displayed, or returned to the model.
 
 ## License
 
