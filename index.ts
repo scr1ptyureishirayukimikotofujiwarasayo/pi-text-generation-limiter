@@ -270,7 +270,7 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
       const candidates = ["status", "toggle", "on", "off", "think", "think on", "think off", "think toggle", "think 20", "think 50", "think 100", "think 200", "think 300", "think 400", "think 500", "20", "50", "100", "200", "300", "400", "500"];
       const typed = prefix.trim().toLowerCase();
       // Numeric input is free-form: never offer suggestions for it, so Enter submits exactly what was typed
-      if (/^\d/.test(typed)) return null;
+      if (/^\d/.test(typed) || /^think\s+\d/.test(typed)) return null;
       const matches = candidates
         .filter((value) => value.startsWith(typed))
         .map((value) => ({ value, label: value }));
