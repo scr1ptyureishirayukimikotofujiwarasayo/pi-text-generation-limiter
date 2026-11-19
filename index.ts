@@ -35,6 +35,9 @@ const TRUNCATION_MARKER = " ...(text truncated by limiter)";
 interface LimiterState {
   enabled: boolean;
   wordLimit: number;
+  /** Separate word budget for model reasoning (thinking) blocks. Does not cap reasoning tokens. */
+  reasoningEnabled: boolean;
+  reasoningWordLimit: number;
 }
 
 /** Count whitespace-separated words in text */
@@ -60,14 +63,16 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
   const state: LimiterState = {
     enabled: false,
     wordLimit: DEFAULT_WORD_LIMIT,
+    reasoningEnabled: false,
+    reasoningWordLimit: DEFAULT_WORD_LIMIT,
   };
 
   /** Update UI status display */
   const setStatus = (ctx: ExtensionContext): void => {
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      state.enabled ? `≤${state.wordLimit}w` : undefined,
-    );
+    const parts: string[] = [];
+    if (state.enabled) parts.push(`≤${state.wordLimit}w`);
+    if (state.reasoningEnabled) parts.push(`think≤${state.reasoningWordLimit}w`);
+    ctx.ui.setStatus(STATUS_KEY, parts.length > 0 ? parts.join(" ") : undefined);
   };
 
   /** Save state to session */
@@ -75,6 +80,8 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     pi.appendEntry(STATE_ENTRY, {
       enabled: state.enabled,
       wordLimit: state.wordLimit,
+      reasoningEnabled: state.reasoningEnabled,
+      reasoningWordLimit: state.reasoningWordLimit,
     });
   };
 
@@ -88,17 +95,21 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
       if (typeof data.wordLimit === "number") {
         state.wordLimit = Math.min(MAX_WORD_LIMIT, Math.max(MIN_WORD_LIMIT, Math.round(data.wordLimit)));
       }
+      if (typeof data.reasoningEnabled === "boolean") state.reasoningEnabled = data.reasoningEnabled;
+      if (typeof data.reasoningWordLimit === "number") {
+        state.reasoningWordLimit = Math.min(MAX_WORD_LIMIT, Math.max(MIN_WORD_LIMIT, Math.round(data.reasoningWordLimit)));
+      }
     }
     setStatus(ctx);
   };
 
   /** Notify user about current settings */
   const notifySettings = (ctx: ExtensionContext): void => {
-    if (!state.enabled) {
-      ctx.ui.notify("Text generation limiter is OFF", "info");
-      return;
-    }
-    ctx.ui.notify(`Text generation limiter ON: max ${state.wordLimit} words`, "info");
+    const chat = state.enabled ? `chat ON: max ${state.wordLimit} words` : "chat OFF";
+    const reasoning = state.reasoningEnabled
+      ? `reasoning ON: max ${state.reasoningWordLimit} words`
+      : "reasoning OFF";
+    ctx.ui.notify(`Text generation limiter — ${chat}, ${reasoning}`, "info");
   };
 
   /** Commit state changes */
@@ -121,6 +132,27 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
       return;
     }
     state.enabled = enabled;
+    commit(ctx);
+  };
+
+  /** Set reasoning enabled/disabled */
+  const setReasoningEnabled = (ctx: ExtensionContext, enabled: boolean): void => {
+    if (state.reasoningEnabled === enabled) {
+      ctx.ui.notify(enabled ? "Reasoning limiter already ON" : "Reasoning limiter already OFF", "info");
+      return;
+    }
+    state.reasoningEnabled = enabled;
+    commit(ctx);
+  };
+
+  /** Set reasoning word limit */
+  const setReasoningWordLimit = (ctx: ExtensionContext, limit: number): void => {
+    const clamped = Math.min(MAX_WORD_LIMIT, Math.max(MIN_WORD_LIMIT, Math.round(limit)));
+    if (state.reasoningWordLimit === clamped) {
+      ctx.ui.notify(`Reasoning word limit already set to ${clamped}`, "info");
+      return;
+    }
+    state.reasoningWordLimit = clamped;
     commit(ctx);
   };
 
@@ -151,77 +183,91 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     handler: async (ctx) => toggleLimiter(ctx),
   });
 
-  // Truncate finalized assistant messages to apply the word limit.
+  // Register shortcut to toggle the reasoning limiter
+  pi.registerShortcut("ctrl+alt+r", {
+    description: "Toggle reasoning text limiter",
+    handler: async (ctx) => setReasoningEnabled(ctx, !state.reasoningEnabled),
+  });
+
+  // Truncate finalized assistant messages to apply the word limits.
   // `message_end` can return `{ message }` to replace the finalized message
   // (the replacement must keep the same role).
+  // Reasoning (thinking) blocks get their own word budget; text blocks get the chat budget.
   pi.on("message_end", async (event) => {
-    if (!state.enabled || event.message.role !== "assistant") return;
-    const content = event.message.content;
-    // Handle string content
-    if (typeof content === "string") {
-      const wordCount = countWords(content);
-      if (wordCount > state.wordLimit) {
-        return {
-          message: {
-            ...event.message,
-            content: truncateText(content, state.wordLimit)
-          }
-        };
-      }
-      return;
-    }
+    if (event.message.role !== "assistant") return;
+    if (!state.enabled && !state.reasoningEnabled) return;
 
-    // Handle array content (blocks): apply the limit across all text blocks
-    if (Array.isArray(content)) {
-      let remaining = state.wordLimit;
-      let modified = false;
-      const newContent = content.flatMap(block => {
-        if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string") {
-          // Budget exhausted: drop further text blocks entirely
-          if (remaining <= 0) {
+    let content: any = event.message.content;
+    let modified = false;
+
+    if (typeof content === "string") {
+      // String content has no thinking blocks; chat limit only
+      if (state.enabled && countWords(content) > state.wordLimit) {
+        content = truncateText(content, state.wordLimit);
+        modified = true;
+      }
+    } else if (Array.isArray(content)) {
+      // Reasoning budget caps the stored thinking text only, never reasoning tokens.
+      let remainingThink = state.reasoningWordLimit;
+      // Chat budget applies across all text blocks
+      let remainingText = state.wordLimit;
+
+      content = content.flatMap((block: any) => {
+        if (block && typeof block === "object" && block.type === "thinking" && typeof block.thinking === "string") {
+          if (!state.reasoningEnabled) return [block];
+          if (remainingThink <= 0) { modified = true; return []; }
+          const wc = countWords(block.thinking);
+          if (wc > remainingThink) {
             modified = true;
-            return [];
+            const t = truncateText(block.thinking, remainingThink);
+            remainingThink = 0;
+            return [{ ...block, thinking: t }];
           }
-          const wordCount = countWords(block.text);
-          if (wordCount > remaining) {
+          remainingThink -= wc;
+          return [block];
+        }
+        if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
+          if (!state.enabled) return [block];
+          if (remainingText <= 0) { modified = true; return []; }
+          const wc = countWords(block.text);
+          if (wc > remainingText) {
             modified = true;
-            const truncated = truncateText(block.text, remaining);
-            remaining = 0;
-            return [{ ...block, text: truncated }];
+            const t = truncateText(block.text, remainingText);
+            remainingText = 0;
+            return [{ ...block, text: t }];
           }
-          remaining -= wordCount;
+          remainingText -= wc;
         }
         return [block];
       });
-      
-      if (modified) {
-        return {
-          message: {
-            ...event.message,
-            content: newContent
-          }
-        };
-      }
+    }
+
+    if (modified) {
+      return { message: { ...event.message, content } };
     }
   });
 
-  // Cap assistant text while it streams (display only; stored message is unchanged).
-  // An extension has one transformer, so this replaces any other one registered by this plugin.
+  // Cap assistant text and reasoning while they stream (display only; stored message is unchanged).
+  // An extension has one transformer, so this handles both the chat and reasoning surfaces.
   pi.registerMarkdownTransformer(
     (markdown, { messageType, isStreaming }) => {
-      if (!state.enabled || messageType !== "assistant") return markdown;
-      if (countWords(markdown) <= state.wordLimit) return markdown;
+      const limit =
+        messageType === "assistant" && state.enabled ? state.wordLimit :
+        messageType === "assistant-thinking" && state.reasoningEnabled ? state.reasoningWordLimit :
+        undefined;
+      if (limit === undefined) return markdown;
+      if (countWords(markdown) <= limit) return markdown;
       const words = markdown.trim().split(/\s+/);
-      return words.slice(0, state.wordLimit).join(" ") + (isStreaming ? "" : TRUNCATION_MARKER);
+      return words.slice(0, limit).join(" ") + (isStreaming ? "" : TRUNCATION_MARKER);
     },
-    { messageTypes: ["assistant"] },
+    { messageTypes: ["assistant", "assistant-thinking"] },
   );
 
   // Register command to control the limiter
   pi.registerCommand("textlimit", {
     description: "Control the text generation limiter",
     getArgumentCompletions: (prefix: string) => {
-      const candidates = ["status", "toggle", "on", "off", "20", "50", "100", "200", "300", "400", "500"];
+      const candidates = ["status", "toggle", "on", "off", "think", "think on", "think off", "think toggle", "think 20", "think 50", "think 100", "think 200", "think 300", "think 400", "think 500", "20", "50", "100", "200", "300", "400", "500"];
       const typed = prefix.trim().toLowerCase();
       // Numeric input is free-form: never offer suggestions for it, so Enter submits exactly what was typed
       if (/^\d/.test(typed)) return null;
@@ -232,10 +278,31 @@ export default function textGenerationLimiter(pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
-      const usage = "Usage: /textlimit <1-500> | on | off | toggle | status";
+      const usage = "Usage: /textlimit <1-500> | on | off | toggle | status | think <1-500> | think on | think off | think toggle";
 
       if (arg === "" || arg === "status") {
         notifySettings(ctx);
+        return;
+      }
+
+      // Reasoning limiter: /textlimit think [on|off|toggle|<1-500>]
+      if (arg === "think" || arg.startsWith("think ")) {
+        const sub = arg.slice("think".length).trim();
+        if (sub === "" || sub === "toggle") {
+          setReasoningEnabled(ctx, !state.reasoningEnabled);
+        } else if (sub === "off" || sub === "disable") {
+          setReasoningEnabled(ctx, false);
+        } else if (sub === "on" || sub === "enable") {
+          setReasoningEnabled(ctx, true);
+        } else {
+          const value = Number(sub);
+          if (!Number.isFinite(value) || value < MIN_WORD_LIMIT) {
+            ctx.ui.notify(usage, "warning");
+            return;
+          }
+          setReasoningWordLimit(ctx, value);
+          setReasoningEnabled(ctx, true);
+        }
         return;
       }
 

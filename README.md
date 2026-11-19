@@ -36,6 +36,19 @@ Quantum computers use qubits... (automatically truncated if over 100 words)
 
 The footer shows `≤<n>w` (word limit) while on.
 
+### Reasoning limit
+
+The same word limiting can be applied to a model's **reasoning** (thinking) text, with its own budget independent of the chat limit. This caps only the *displayed/stored thinking text*; it never caps reasoning tokens, so the model can finish its reasoning and tasks are not interrupted.
+
+| Command | Result |
+|---|---|
+| `/textlimit think` or `/textlimit think toggle` | Flip reasoning limiter on ⇄ off |
+| `/textlimit think on` / `think off` | Turn reasoning limiter on / off |
+| `/textlimit think 150` | Turn on with a 150-word reasoning limit (`1`–`500`) |
+| `Ctrl+Alt+R` | Toggle reasoning limiter on ⇄ off |
+
+The footer shows `think≤<n>w` while on. The chat and reasoning limits are independent and both persist across sessions. `/textlimit status` shows both.
+
 ### How It Works
 
 When enabled, the extension monitors outgoing assistant messages and automatically truncates any text blocks that exceed your specified word limit. The truncation is marked with a `(text truncated by limiter)` indicator so you know when it has been applied.
